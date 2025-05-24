@@ -16,3 +16,15 @@ class PaymentStatusResponse(BaseModel):
     last_updated: datetime
     stripe_status: Optional[str] = None
     stripe_session_status: Optional[str] = None
+
+class PaymentSuccessResponse(BaseModel):
+    success: bool
+    message: str
+    order_id: int
+    status: str
+
+class PaymentCancelResponse(BaseModel):
+    success: bool
+    message: str
+    order_id: int
+    status: str

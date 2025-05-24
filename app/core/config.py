@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     
     ALLOWED_ORIGINS: List[str] = ["http://localhost:3000", "http://localhost:8080"]
     
+    # Frontend URL for payment redirects
+    FRONTEND_URL: str = os.getenv("FRONTEND_URL", "")
+
     STRIPE_API_KEY: str = os.getenv("STRIPE_API_KEY", "")
     STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     
