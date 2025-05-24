@@ -1,15 +1,14 @@
 # app/core/config.py
 import os
 from pydantic_settings import BaseSettings
-from typing import List, Optional
-
+from typing import List
 
 class Settings(BaseSettings):
     PROJECT_NAME: str = "AI Subtitles Platform"
     API_V1_STR: str = "/api"
     SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-here")
     ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 30 * 24 * 60  # 30 days
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24
 
     POSTGRES_USER: str = os.getenv("DB_USER", "postgres")
     POSTGRES_PASSWORD: str = os.getenv("DB_PASSWORD", "123")
@@ -23,27 +22,15 @@ class Settings(BaseSettings):
     STRIPE_API_KEY: str = os.getenv("STRIPE_API_KEY", "")
     STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     
-    ASSEMBLYAI_API_KEY: str = os.getenv("ASSEMBLYAI_API_KEY", "")
+    ASSEMBLY_AI_API_KEY: str = os.getenv("ASSEMBLY_AI_API_KEY", "")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
     DEEPL_API_KEY: str = os.getenv("DEEPL_API_KEY", "")
     
-    # File handling
-    UPLOAD_DIR: str = "uploads"
-    OUTPUT_DIR: str = "outputs"
-    ALLOWED_EXTENSIONS: set = {".mp4", ".avi", ".mov", ".mkv", ".webm"}
+    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "uploads")
+    OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
     
     MAX_FILE_SIZE: int = 1024 * 1024 * 1024  # 1GB
     PRICE_PER_MINUTE: float = 1.0
-
-    # Stripe Configuration
-    STRIPE_PUBLISHABLE_KEY: Optional[str] = None
-    STRIPE_SECRET_KEY: Optional[str] = None
-    STRIPE_WEBHOOK_SECRET: Optional[str] = None
-    
-    # Frontend URLs
-    FRONTEND_URL: str = "http://localhost:3000"
-    FRONTEND_SUCCESS_URL: str = "http://localhost:3000/orders/{order_id}/success"
-    FRONTEND_CANCEL_URL: str = "http://localhost:3000/orders/{order_id}/cancel"
     
     class Config:
         env_file = ".env"
