@@ -86,8 +86,23 @@ async def create_tables():
             payment_intent_id VARCHAR(255),
             payment_status VARCHAR(50) DEFAULT 'unpaid',
             admin_notes TEXT,
-            processed_by INTEGER REFERENCES users(id)
+            processed_by INTEGER REFERENCES users(id),
+            approved_by INTEGER REFERENCES users(id),
+            rejected_by INTEGER REFERENCES users(id),
+            error_message TEXT
         )
+        ''')
+
+        await conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_orders_approved_by ON orders(approved_by)
+        ''')
+
+        await conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_orders_rejected_by ON orders(rejected_by)
+        ''')
+
+        await conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_orders_processed_by ON orders(processed_by)
         ''')
         
         await conn.execute('''
@@ -103,8 +118,13 @@ async def create_tables():
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             cleanup_timestamp TIMESTAMP WITH TIME ZONE,
-            qa_notes TEXT
+            qa_notes TEXT,
+            error_message TEXT
         )
+        ''')
+
+        await conn.execute('''
+        CREATE INDEX IF NOT EXISTS idx_videos_status ON videos(status);
         ''')
         
         await conn.execute('''
@@ -133,7 +153,8 @@ async def create_tables():
             file_format VARCHAR(20) NOT NULL,
             created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
             qa_status VARCHAR(20) DEFAULT 'pending',
-            qa_notes TEXT
+            qa_notes TEXT,
+            transcript_id VARCHAR(255)
         )
         ''')
         

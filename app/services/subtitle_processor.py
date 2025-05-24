@@ -1,467 +1,424 @@
-# app/services/subtitle_processor.py
 import asyncio
 import asyncpg
 import os
-import json
 import logging
-import requests
+import shutil
+from typing import Optional, Dict, Any
 from datetime import datetime
-from typing import List, Dict, Any
+import assemblyai as aai
 from app.core.config import settings
-from app.core.utils import delete_file, create_output_directory
-from app.models.order import OrderStatus, VideoStatus, OutputFormat
+from app.core.database import get_db_connection
+from app.models.order import Genre, OrderStatus, OutputFormat, PaymentStatus
+# from app.models.subtitle import Genre, OutputFormat
 
 logger = logging.getLogger(__name__)
 
+aai.settings.api_key = settings.ASSEMBLYAI_API_KEY
+
 async def process_order(order_id: int):
-    """Process a paid order by generating subtitles for all videos"""
+    """Process an order by generating subtitles for all videos"""
     conn = None
     try:
-        # Connect to database
         conn = await asyncpg.connect(settings.DATABASE_URL)
         
-        # Update order status
-        await conn.execute(
-            "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-            OrderStatus.PROCESSING, order_id
-        )
-        
-        # Get order details
         order = await conn.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
-        user_id = order["user_id"]
+        if not order:
+            logger.error(f"Order {order_id} not found")
+            return
         
-        # Get subtitle config
-        subtitle_config = await conn.fetchrow(
-            "SELECT * FROM subtitle_configs WHERE order_id = $1", order_id
-        )
+        if order["payment_status"] != PaymentStatus.PAID:
+            logger.error(f"Order {order_id} payment not confirmed")
+            return
         
-        # Get videos
-        videos = await conn.fetch(
-            "SELECT * FROM videos WHERE order_id = $1", order_id
-        )
+        await conn.execute("""
+            UPDATE orders 
+            SET status = $1, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = $2
+        """, OrderStatus.PROCESSING, order_id)
         
-        # Create output directory
-        output_dir = create_output_directory(user_id, order_id)
+        videos = await conn.fetch("SELECT * FROM videos WHERE order_id = $1", order_id)
+        config = await conn.fetchrow("SELECT * FROM subtitle_configs WHERE order_id = $1", order_id)
         
-        # Process each video
+        if not videos or not config:
+            logger.error(f"No videos or config found for order {order_id}")
+            await mark_order_failed(conn, order_id, "Missing videos or configuration")
+            return
+        
+        success_count = 0
         for video in videos:
             try:
-                # Update video status
-                await conn.execute(
-                    "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-                    VideoStatus.PROCESSING, video["id"]
-                )
-                
-                # Process video
-                subtitle_files = await generate_subtitles(
-                    video, subtitle_config, output_dir, conn
-                )
-                
-                # Update video status
-                await conn.execute(
-                    "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-                    VideoStatus.COMPLETED, video["id"]
-                )
-                
-                # Delete source video file after processing
-                await delete_file(video["file_path"])
+                await process_video_subtitles(conn, video, config, order)
+                success_count += 1
             except Exception as e:
-                logger.error(f"Error processing video {video['id']} for order {order_id}: {e}")
-                
-                # Update video status to failed
-                await conn.execute(
-                    "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-                    VideoStatus.FAILED, video["id"]
-                )
+                logger.error(f"Failed to process video {video['id']}: {e}")
+                await conn.execute("""
+                    UPDATE videos 
+                    SET status = $1, updated_at = CURRENT_TIMESTAMP, error_message = $2
+                    WHERE id = $3
+                """, OrderStatus.FAILED, str(e), video['id'])
         
-        # Check if all videos are processed
-        all_videos_processed = True
-        videos_status = await conn.fetch(
-            "SELECT status FROM videos WHERE order_id = $1", order_id
-        )
-        
-        for video_status in videos_status:
-            if video_status["status"] not in [VideoStatus.COMPLETED, VideoStatus.FAILED]:
-                all_videos_processed = False
-                break
-        
-        # Update order status
-        final_status = OrderStatus.COMPLETED if all_videos_processed else OrderStatus.FAILED
-        await conn.execute(
-            "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-            final_status, order_id
-        )
+        if success_count == len(videos):
+            await conn.execute("""
+                UPDATE orders 
+                SET status = $1, updated_at = CURRENT_TIMESTAMP 
+                WHERE id = $2
+            """, OrderStatus.COMPLETED, order_id)
+            logger.info(f"Order {order_id} completed successfully")
+        elif success_count > 0:
+            await conn.execute("""
+                UPDATE orders 
+                SET status = $1, updated_at = CURRENT_TIMESTAMP 
+                WHERE id = $2
+            """, OrderStatus.PARTIALLY_COMPLETED, order_id)
+            logger.warning(f"Order {order_id} partially completed ({success_count}/{len(videos)})")
+        else:
+            await mark_order_failed(conn, order_id, "All videos failed to process")
+    
     except Exception as e:
         logger.error(f"Error processing order {order_id}: {e}")
-        
-        # Update order status to failed
         if conn:
-            await conn.execute(
-                "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-                OrderStatus.FAILED, order_id
-            )
+            await mark_order_failed(conn, order_id, f"Processing error: {str(e)}")
     finally:
-        # Close database connection
         if conn:
             await conn.close()
 
-async def generate_subtitles(
-    video: Dict[str, Any],
-    config: Dict[str, Any],
-    output_dir: str,
-    conn: asyncpg.Connection
-) -> List[str]:
-    """Generate subtitle files for a video using AI services"""
+async def process_video_subtitles(conn: asyncpg.Connection, video: dict, config: dict, order: dict):
+    """Generate subtitles for a single video using AssemblyAI"""
     try:
-        # Generate subtitles with AssemblyAI
-        speech_subtitles = await generate_speech_subtitles(
-            video["file_path"], config["source_language"]
-        )
+        video_path = video['file_path']
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
         
-        # Generate non-verbal sound subtitles with YAMNet
-        sound_subtitles = await generate_sound_subtitles(
-            video["file_path"], config["genre"]
-        )
+        await conn.execute("""
+            UPDATE videos 
+            SET status = $1, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = $2
+        """, OrderStatus.PROCESSING, video['id'])
         
-        # Merge both subtitle types, filter and normalize as needed
-        merged_subtitles = merge_subtitles(
-            speech_subtitles, 
-            sound_subtitles, 
-            config["accessibility_mode"],
-            config["non_verbal_only_mode"]
-        )
+        transcription_config = create_transcription_config(config)
+        transcriber = aai.Transcriber()
         
-        # Format according to user preferences
-        formatted_subtitles = format_subtitles(
-            merged_subtitles,
-            config["max_chars_per_line"],
-            config["lines_per_subtitle"]
-        )
+        logger.info(f"Starting transcription for video {video['id']} using AssemblyAI")
+        transcript = transcriber.transcribe(video_path, config=transcription_config)
         
-        # Translate non-verbal labels if needed
-        if config["target_language"] and config["target_language"] != config["source_language"]:
-            translated_subtitles = await translate_subtitles(
-                formatted_subtitles,
-                config["source_language"],
-                config["target_language"]
-            )
+        if transcript.status == aai.TranscriptStatus.error:
+            raise Exception(f"AssemblyAI transcription failed: {transcript.error}")
+        
+        output_dir = os.path.join(settings.OUTPUT_DIR, str(order['user_id']), str(order['id']))
+        os.makedirs(output_dir, exist_ok=True)
+        
+        base_filename = os.path.splitext(video['original_filename'])[0]
+        
+        subtitle_content = generate_subtitle_content(transcript, config)
+        subtitle_filename = f"{base_filename}.{config['output_format']}"
+        subtitle_path = os.path.join(output_dir, subtitle_filename)
+        
+        with open(subtitle_path, 'w', encoding='utf-8') as f:
+            f.write(subtitle_content)
+        
+        await conn.fetchval("""
+            INSERT INTO subtitle_files (video_id, config_id, file_path, file_format, qa_status, transcript_id)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+        """, video['id'], config['id'], subtitle_path, config['output_format'], 'pending', transcript.id)
+        
+        await conn.execute("""
+            UPDATE videos 
+            SET status = $1, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = $2
+        """, OrderStatus.COMPLETED, video['id'])
+        
+        logger.info(f"Subtitles generated successfully for video {video['id']}")
+        
+    except Exception as e:
+        logger.error(f"Error processing video {video['id']}: {e}")
+        raise
+
+def create_transcription_config(config: dict) -> aai.TranscriptionConfig:
+    """Create AssemblyAI transcription configuration based on subtitle config"""
+    transcription_config = aai.TranscriptionConfig()
+    
+    if config.get('source_language'):
+        language_map = {
+            'en': aai.LanguageCode.en_us,
+            'es': aai.LanguageCode.es,
+            'fr': aai.LanguageCode.fr,
+            'de': aai.LanguageCode.de,
+            'it': aai.LanguageCode.it,
+            'pt': aai.LanguageCode.pt,
+            'ru': aai.LanguageCode.ru,
+            'ja': aai.LanguageCode.ja,
+            'ko': aai.LanguageCode.ko,
+            'zh': aai.LanguageCode.zh,
+            'hi': aai.LanguageCode.hi,
+        }
+        source_lang = config['source_language']
+        if source_lang in language_map:
+            transcription_config.language_code = language_map[source_lang]
         else:
-            translated_subtitles = formatted_subtitles
-        
-        # Export to requested format(s)
-        subtitle_files = []
-        output_format = config["output_format"]
-        
-        # Determine output filename base
-        filename_base = f"{os.path.splitext(video['original_filename'])[0]}"
-        
-        # Export to the requested format
-        output_file = export_subtitles(
-            translated_subtitles,
-            output_dir,
-            filename_base,
-            output_format
-        )
-        subtitle_files.append(output_file)
-        
-        # Save subtitle files to database
-        for file_path in subtitle_files:
-            await conn.execute("""
-                INSERT INTO subtitle_files (video_id, config_id, file_path, file_format)
-                VALUES ($1, $2, $3, $4)
-            """, video["id"], config["id"], file_path, os.path.splitext(file_path)[1][1:])
-        
-        return subtitle_files
-    except Exception as e:
-        logger.error(f"Error generating subtitles: {e}")
-        raise
+            logger.warning(f"Unsupported language '{source_lang}', defaulting to English")
+            transcription_config.language_code = aai.LanguageCode.en_us
+    
+    transcription_config.punctuate = True
+    transcription_config.format_text = True
+    
+    if config.get('accessibility_mode'):
+        transcription_config.speaker_labels = True
+        transcription_config.filter_profanity = True
+    
+    genre = config.get('genre', Genre.GENERAL)
+    if genre == Genre.MEETING:
+        transcription_config.speaker_labels = True
+        transcription_config.auto_chapters = True
+    elif genre == Genre.PODCAST:
+        transcription_config.speaker_labels = True
+        transcription_config.auto_highlights = True
+    elif genre == Genre.LECTURE:
+        transcription_config.auto_chapters = True
+    elif genre == Genre.INTERVIEW:
+        transcription_config.speaker_labels = True
+    
+    if config.get('non_verbal_only_mode'):
+        transcription_config.filter_profanity = True
+        transcription_config.redact_pii = True
+    
+    return transcription_config
 
-async def generate_speech_subtitles(file_path: str, language: str) -> List[Dict]:
-    """
-    Generate speech subtitles using AssemblyAI API
-    This is a placeholder implementation - in production you would implement the actual API call
-    """
-    try:
-        # Placeholder implementation
-        # In a real implementation, you would:
-        # 1. Upload the file to AssemblyAI
-        # 2. Start transcription job
-        # 3. Poll for completion
-        # 4. Get results and format as subtitles
-        
-        # Simulated result
-        return [
-            {"start": 0, "end": 5000, "text": "This is sample speech text.", "type": "speech"},
-            {"start": 6000, "end": 10000, "text": "More sample text here.", "type": "speech"},
-        ]
-    except Exception as e:
-        logger.error(f"Error generating speech subtitles: {e}")
-        raise
+def generate_subtitle_content(transcript: aai.Transcript, config: dict) -> str:
+    """Generate subtitle content in the requested format"""
+    output_format = config.get('output_format', OutputFormat.SRT)
+    target_language = config.get('target_language')
+    
+    if target_language and target_language != config.get('source_language'):
+        subtitle_content = translate_subtitles(transcript, target_language, output_format, config)
+    else:
+        if output_format == OutputFormat.SRT:
+            subtitle_content = transcript.export_subtitles_srt()
+        elif output_format == OutputFormat.VTT:
+            subtitle_content = transcript.export_subtitles_vtt()
+        elif output_format == OutputFormat.ASS:
+            subtitle_content = convert_to_ass_format(transcript, config)
+        else:
+            subtitle_content = transcript.export_subtitles_srt()
+    
+    return apply_subtitle_formatting(subtitle_content, config)
 
-async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
-    """
-    Generate non-verbal sound subtitles using YAMNet
-    This is a placeholder implementation - in production you would implement the actual model usage
-    """
+def translate_subtitles(transcript: aai.Transcript, target_language: str, output_format: str, config: dict) -> str:
+    """Translate subtitles to target language using LeMUR"""
     try:
-        # Placeholder implementation
-        # In a real implementation, you would:
-        # 1. Extract audio from video
-        # 2. Run YAMNet model on audio segments
-        # 3. Identify sound events
-        # 4. Format as subtitles
+        language_names = {
+            'es': 'Spanish',
+            'fr': 'French',
+            'de': 'German',
+            'it': 'Italian',
+            'pt': 'Portuguese',
+            'ru': 'Russian',
+            'ja': 'Japanese',
+            'ko': 'Korean',
+            'zh': 'Chinese',
+            'hi': 'Hindi',
+            'ar': 'Arabic'
+        }
         
-        # Simulated result
-        return [
-            {"start": 2500, "end": 3500, "text": "Door slamming", "type": "sound"},
-            {"start": 8000, "end": 9000, "text": "Footsteps", "type": "sound"},
-        ]
+        target_language_name = language_names.get(target_language, target_language)
+        
+        prompt = f"""
+        Translate the following transcript to {target_language_name}. 
+        Maintain the timing structure and format it as {output_format.upper()} subtitles.
+        Keep the same sentence breaks and timing as much as possible.
+        Make sure translations are natural and appropriate for subtitles.
+        
+        Original transcript:
+        {transcript.text}
+        """
+        
+        result = transcript.lemur.task(prompt)
+        return result.response
+        
     except Exception as e:
-        logger.error(f"Error generating sound subtitles: {e}")
-        raise
+        logger.warning(f"Translation failed, using original: {e}")
+        if output_format == OutputFormat.SRT:
+            return transcript.export_subtitles_srt()
+        elif output_format == OutputFormat.VTT:
+            return transcript.export_subtitles_vtt()
+        else:
+            return transcript.export_subtitles_srt()
 
-def merge_subtitles(
-    speech_subtitles: List[Dict],
-    sound_subtitles: List[Dict],
-    accessibility_mode: bool,
-    non_verbal_only_mode: bool
-) -> List[Dict]:
-    """Merge speech and sound subtitles according to user preferences"""
-    try:
-        merged = []
+def convert_to_ass_format(transcript: aai.Transcript, config: dict) -> str:
+    """Convert transcript to Advanced SubStation Alpha (.ass) format"""
+    ass_header = """[Script Info]
+Title: Generated Subtitles
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,16,&H00FFFFFF,&H000000FF,&H00000000,&H00808080,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+    
+    srt_content = transcript.export_subtitles_srt()
+    ass_events = ""
+    
+    import re
+    srt_pattern = r'(\d+)\n(\d{2}:\d{2}:\d{2},\d{3}) --> (\d{2}:\d{2}:\d{2},\d{3})\n(.*?)(?=\n\d+\n|\Z)'
+    matches = re.findall(srt_pattern, srt_content, re.DOTALL)
+    
+    for match in matches:
+        start_time = match[1].replace(',', '.')
+        end_time = match[2].replace(',', '.')
+        text = match[3].replace('\n', '\\N')
         
-        # If non-verbal only mode is enabled, only include sound subtitles
-        if non_verbal_only_mode:
-            for sub in sound_subtitles:
-                # Format non-verbal sounds with brackets
-                sub["text"] = f"[{sub['text']}]"
-                merged.append(sub)
-            return sorted(merged, key=lambda x: x["start"])
+        start_ass = convert_srt_time_to_ass(start_time)
+        end_ass = convert_srt_time_to_ass(end_time)
         
-        # Otherwise, include both speech and sound subtitles
-        merged = speech_subtitles.copy()
-        
-        for sound_sub in sound_subtitles:
-            # Format non-verbal sounds with brackets
-            sound_sub["text"] = f"[{sound_sub['text']}]"
-            
-            # If accessibility mode is enabled, add all sound subtitles
-            if accessibility_mode:
-                merged.append(sound_sub)
+        ass_events += f"Dialogue: 0,{start_ass},{end_ass},Default,,0,0,0,,{text}\n"
+    
+    return ass_header + ass_events
+
+def convert_srt_time_to_ass(srt_time: str) -> str:
+    """Convert SRT time format to ASS time format"""
+    time_part, ms_part = srt_time.split('.')
+    return f"{time_part}.{ms_part[:2]}"
+
+def apply_subtitle_formatting(content: str, config: dict) -> str:
+    """Apply formatting rules based on configuration"""
+    max_chars = config.get('max_chars_per_line', 42)
+    max_lines = config.get('lines_per_subtitle', 2)
+    
+    lines = content.split('\n')
+    formatted_lines = []
+    
+    for line in lines:
+        if '-->' in line or line.isdigit() or not line.strip():
+            formatted_lines.append(line)
+        else:
+            formatted_line = format_subtitle_line(line, max_chars, max_lines)
+            formatted_lines.append(formatted_line)
+    
+    return '\n'.join(formatted_lines)
+
+def format_subtitle_line(text: str, max_chars: int, max_lines: int) -> str:
+    """Format a subtitle line to respect character and line limits"""
+    if len(text) <= max_chars:
+        return text
+    
+    words = text.split()
+    lines = []
+    current_line = ""
+    
+    for word in words:
+        test_line = f"{current_line} {word}".strip()
+        if len(test_line) <= max_chars:
+            current_line = test_line
+        else:
+            if current_line:
+                lines.append(current_line)
+                current_line = word
             else:
-                # Otherwise, only add sounds that don't overlap with speech
-                is_overlapping = False
-                for speech_sub in speech_subtitles:
-                    # Check for overlap
-                    if (sound_sub["start"] <= speech_sub["end"] and 
-                        sound_sub["end"] >= speech_sub["start"]):
-                        is_overlapping = True
-                        break
-                
-                if not is_overlapping:
-                    merged.append(sound_sub)
-        
-        # Sort by start time
-        return sorted(merged, key=lambda x: x["start"])
-    except Exception as e:
-        logger.error(f"Error merging subtitles: {e}")
-        raise
+                lines.append(word[:max_chars])
+                current_line = word[max_chars:] if len(word) > max_chars else ""
+            
+            if len(lines) >= max_lines:
+                break
+    
+    if current_line and len(lines) < max_lines:
+        lines.append(current_line)
+    
+    return '\n'.join(lines)
 
-def format_subtitles(
-    subtitles: List[Dict],
-    max_chars_per_line: int,
-    lines_per_subtitle: int
-) -> List[Dict]:
-    """Format subtitles according to user preferences"""
+async def mark_order_failed(conn: asyncpg.Connection, order_id: int, error_message: str):
+    """Mark an order as failed with error message"""
     try:
-        formatted = []
-        
-        for sub in subtitles:
-            # If it's a non-verbal sound, keep as is
-            if sub["type"] == "sound" or sub["text"].startswith("["):
-                formatted.append(sub)
-                continue
-            
-            # For speech, format according to preferences
-            text = sub["text"]
-            max_chars = max_chars_per_line * lines_per_subtitle
-            
-            # If text is already short enough, keep as is
-            if len(text) <= max_chars:
-                formatted.append(sub)
-                continue
-            
-            # Otherwise, split into multiple subtitle entries
-            words = text.split()
-            current_text = ""
-            current_chars = 0
-            
-            for word in words:
-                if current_chars + len(word) + 1 <= max_chars:
-                    if current_text:
-                        current_text += " "
-                        current_chars += 1
-                    current_text += word
-                    current_chars += len(word)
-                else:
-                    # Create new subtitle entry
-                    if current_text:
-                        duration = sub["end"] - sub["start"]
-                        chars_ratio = len(current_text) / len(text)
-                        partial_duration = int(duration * chars_ratio)
-                        
-                        formatted.append({
-                            "start": sub["start"],
-                            "end": sub["start"] + partial_duration,
-                            "text": current_text,
-                            "type": "speech"
-                        })
-                        
-                        sub["start"] += partial_duration
-                        current_text = word
-                        current_chars = len(word)
-            
-            # Add last part if any
-            if current_text:
-                formatted.append({
-                    "start": sub["start"],
-                    "end": sub["end"],
-                    "text": current_text,
-                    "type": "speech"
-                })
-        
-        # Sort by start time
-        return sorted(formatted, key=lambda x: x["start"])
-    except Exception as e:
-        logger.error(f"Error formatting subtitles: {e}")
-        raise
+        await conn.execute("""
+            UPDATE orders 
+            SET status = $1, updated_at = CURRENT_TIMESTAMP, error_message = $2
+            WHERE id = $3
+        """, OrderStatus.FAILED, error_message, order_id)
+    except Exception:
+        # Fallback if error_message column doesn't exist
+        await conn.execute("""
+            UPDATE orders 
+            SET status = $1, updated_at = CURRENT_TIMESTAMP 
+            WHERE id = $2
+        """, OrderStatus.FAILED, order_id)
+    
+    logger.error(f"Order {order_id} marked as failed: {error_message}")
 
-async def translate_subtitles(
-    subtitles: List[Dict],
-    source_language: str,
-    target_language: str
-) -> List[Dict]:
-    """
-    Translate subtitles to target language using DeepL or OpenAI
-    This is a placeholder implementation - in production you would implement the actual API calls
-    """
+async def reprocess_order(order_id: int, notes: Optional[str] = None):
+    """Reprocess a failed or completed order"""
+    conn = None
     try:
-        # Placeholder implementation
-        # In a real implementation, you would:
-        # 1. Extract texts to translate
-        # 2. Call translation API (DeepL or OpenAI)
-        # 3. Replace texts with translations
+        conn = await asyncpg.connect(settings.DATABASE_URL)
         
-        # For this example, we'll just return the original subtitles
-        return subtitles
+        order = await conn.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
+        if not order:
+            raise ValueError(f"Order {order_id} not found")
+        
+        if order["payment_status"] != PaymentStatus.PAID:
+            raise ValueError("Order must be paid to reprocess")
+        
+        await conn.execute("""
+            UPDATE orders 
+            SET status = $1, updated_at = CURRENT_TIMESTAMP, admin_notes = $2
+            WHERE id = $3
+        """, OrderStatus.PROCESSING, notes, order_id)
+        
+        subtitle_files = await conn.fetch("""
+            SELECT sf.* FROM subtitle_files sf
+            JOIN videos v ON sf.video_id = v.id
+            WHERE v.order_id = $1
+        """, order_id)
+        
+        for subtitle_file in subtitle_files:
+            if os.path.exists(subtitle_file['file_path']):
+                os.remove(subtitle_file['file_path'])
+        
+        await conn.execute("""
+            DELETE FROM subtitle_files 
+            WHERE video_id IN (SELECT id FROM videos WHERE order_id = $1)
+        """, order_id)
+        
+        await process_order(order_id)
+        
     except Exception as e:
-        logger.error(f"Error translating subtitles: {e}")
+        logger.error(f"Error reprocessing order {order_id}: {e}")
+        if conn:
+            await mark_order_failed(conn, order_id, f"Reprocessing error: {str(e)}")
         raise
+    finally:
+        if conn:
+            await conn.close()
 
-def export_subtitles(
-    subtitles: List[Dict],
-    output_dir: str,
-    filename_base: str,
-    output_format: str
-) -> str:
-    """Export subtitles to the requested format"""
+def get_video_duration(file_path: str) -> float:
+    """Get video duration using ffprobe"""
     try:
-        output_file = os.path.join(output_dir, f"{filename_base}.{output_format}")
-        
-        with open(output_file, "w", encoding="utf-8") as f:
-            if output_format == OutputFormat.SRT:
-                write_srt(f, subtitles)
-            elif output_format == OutputFormat.VTT:
-                write_vtt(f, subtitles)
-            elif output_format == OutputFormat.ASS:
-                write_ass(f, subtitles)
-            elif output_format == OutputFormat.TXT:
-                write_txt(f, subtitles)
-        
-        return output_file
+        import subprocess
+        result = subprocess.run([
+            'ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1', file_path
+        ], capture_output=True, text=True)
+        return float(result.stdout.strip())
     except Exception as e:
-        logger.error(f"Error exporting subtitles: {e}")
-        raise
+        logger.warning(f"Could not get video duration: {e}")
+        return 0.0
 
-def write_srt(file, subtitles: List[Dict]):
-    """Write subtitles in SRT format"""
-    for i, sub in enumerate(subtitles):
-        # Convert milliseconds to SRT time format (HH:MM:SS,mmm)
-        start_time = format_srt_time(sub["start"])
-        end_time = format_srt_time(sub["end"])
-        
-        file.write(f"{i+1}\n")
-        file.write(f"{start_time} --> {end_time}\n")
-        file.write(f"{sub['text']}\n\n")
-
-def write_vtt(file, subtitles: List[Dict]):
-    """Write subtitles in WebVTT format"""
-    file.write("WEBVTT\n\n")
+async def update_subtitle_qa_status(conn: asyncpg.Connection, subtitle_id: int, qa_status: str, qa_notes: Optional[str] = None):
+    """Update QA status for a subtitle file"""
+    await conn.execute("""
+        UPDATE subtitle_files 
+        SET qa_status = $1, qa_notes = $2, updated_at = CURRENT_TIMESTAMP
+        WHERE id = $3
+    """, qa_status, qa_notes, subtitle_id)
     
-    for i, sub in enumerate(subtitles):
-        # Convert milliseconds to WebVTT time format (HH:MM:SS.mmm)
-        start_time = format_vtt_time(sub["start"])
-        end_time = format_vtt_time(sub["end"])
-        
-        file.write(f"{i+1}\n")
-        file.write(f"{start_time} --> {end_time}\n")
-        file.write(f"{sub['text']}\n\n")
-
-def write_ass(file, subtitles: List[Dict]):
-    """Write subtitles in Advanced SubStation Alpha format"""
-    file.write("[Script Info]\n")
-    file.write("Title: Generated Subtitles\n")
-    file.write("ScriptType: v4.00+\n")
-    file.write("PlayResX: 1280\n")
-    file.write("PlayResY: 720\n\n")
-    
-    file.write("[V4+ Styles]\n")
-    file.write("Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n")
-    file.write("Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1\n\n")
-    
-    file.write("[Events]\n")
-    file.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
-    
-    for sub in subtitles:
-        # Convert milliseconds to ASS time format (H:MM:SS.mm)
-        start_time = format_ass_time(sub["start"])
-        end_time = format_ass_time(sub["end"])
-        
-        file.write(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{sub['text']}\n")
-
-def write_txt(file, subtitles: List[Dict]):
-    """Write subtitles in plain text format"""
-    for sub in subtitles:
-        # Convert milliseconds to time format (HH:MM:SS)
-        start_time = format_txt_time(sub["start"])
-        
-        file.write(f"[{start_time}] {sub['text']}\n")
-
-def format_srt_time(ms: int) -> str:
-    """Format milliseconds as SRT time (HH:MM:SS,mmm)"""
-    s, ms = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-def format_vtt_time(ms: int) -> str:
-    """Format milliseconds as WebVTT time (HH:MM:SS.mmm)"""
-    s, ms = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
-
-def format_ass_time(ms: int) -> str:
-    """Format milliseconds as ASS time (H:MM:SS.mm)"""
-    s, ms = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    cs = ms // 10  # Centiseconds
-    return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
-
-def format_txt_time(ms: int) -> str:
-    """Format milliseconds as simple time (HH:MM:SS)"""
-    s, ms = divmod(ms, 1000)
-    m, s = divmod(s, 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+    if qa_status == 'rejected':
+        subtitle_file = await conn.fetchrow("SELECT * FROM subtitle_files WHERE id = $1", subtitle_id)
+        if subtitle_file:
+            video = await conn.fetchrow("SELECT * FROM videos WHERE id = $1", subtitle_file['video_id'])
+            if video:
+                await conn.execute("""
+                    UPDATE orders 
+                    SET status = $1, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $2
+                """, OrderStatus.REQUIRES_REVIEW, video['order_id'])
