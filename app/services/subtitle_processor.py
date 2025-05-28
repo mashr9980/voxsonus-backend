@@ -5,76 +5,120 @@ import os
 import json
 import logging
 import requests
+import time
+import tempfile
 from datetime import datetime
 from typing import List, Dict, Any
+from openai import AsyncOpenAI
+import tensorflow as tf
+import tensorflow_hub as hub
+import numpy as np
+import soundfile as sf
+import assemblyai as aai
+from moviepy.video.io.VideoFileClip import VideoFileClip
 from app.core.config import settings
 from app.core.utils import delete_file, create_output_directory
 from app.models.order import OrderStatus, VideoStatus, OutputFormat
 
 logger = logging.getLogger(__name__)
 
+# Genre-based sound filtering rules
+GENRE_SOUND_FILTERS = {
+    "horror": {
+        "allowed": ["scream", "thunder", "door_slam", "footsteps", "whisper", "breathing", "heartbeat", "glass_break", "gunshot", "explosion"],
+        "blocked": ["laughter", "applause", "music", "cheer"]
+    },
+    "comedy": {
+        "allowed": ["laughter", "applause", "cheer", "music", "footsteps", "door_slam"],
+        "blocked": ["scream", "gunshot", "explosion", "thunder"]
+    },
+    "romance": {
+        "allowed": ["music", "whisper", "breathing", "footsteps", "door_slam", "laughter"],
+        "blocked": ["gunshot", "explosion", "scream", "thunder"]
+    },
+    "action": {
+        "allowed": ["gunshot", "explosion", "footsteps", "car_engine", "door_slam", "glass_break", "thunder"],
+        "blocked": ["whisper", "breathing", "laughter"]
+    },
+    "documentary": {
+        "allowed": ["footsteps", "door_slam", "car_engine", "music", "applause"],
+        "blocked": ["scream", "gunshot", "explosion"]
+    },
+    "general": {
+        "allowed": ["footsteps", "door_slam", "laughter", "applause", "music", "car_engine"],
+        "blocked": []
+    }
+}
+
+# YAMNet label to normalized format mapping
+YAMNET_LABEL_MAPPING = {
+    "Speech": "Speech",
+    "Music": "Music",
+    "Laughter": "Laughter",
+    "Applause": "Applause",
+    "Footsteps": "Footsteps",
+    "Door": "Door slam",
+    "Car": "Car engine",
+    "Thunder": "Thunder",
+    "Glass": "Glass breaking",
+    "Gunshot": "Gunshot",
+    "Explosion": "Explosion", 
+    "Scream": "Scream",
+    "Whisper": "Whisper",
+    "Breathing": "Breathing",
+    "Heartbeat": "Heartbeat",
+    "Cheer": "Cheering"
+}
+
 async def process_order(order_id: int):
     """Process a paid order by generating subtitles for all videos"""
     conn = None
     try:
-        # Connect to database
         conn = await asyncpg.connect(settings.DATABASE_URL)
         
-        # Update order status
         await conn.execute(
             "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
             OrderStatus.PROCESSING, order_id
         )
         
-        # Get order details
         order = await conn.fetchrow("SELECT * FROM orders WHERE id = $1", order_id)
         user_id = order["user_id"]
         
-        # Get subtitle config
         subtitle_config = await conn.fetchrow(
             "SELECT * FROM subtitle_configs WHERE order_id = $1", order_id
         )
         
-        # Get videos
         videos = await conn.fetch(
             "SELECT * FROM videos WHERE order_id = $1", order_id
         )
         
-        # Create output directory
         output_dir = create_output_directory(user_id, order_id)
         
-        # Process each video
         for video in videos:
             try:
-                # Update video status
                 await conn.execute(
                     "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     VideoStatus.PROCESSING, video["id"]
                 )
                 
-                # Process video
                 subtitle_files = await generate_subtitles(
                     video, subtitle_config, output_dir, conn
                 )
                 
-                # Update video status
                 await conn.execute(
                     "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     VideoStatus.COMPLETED, video["id"]
                 )
                 
-                # Delete source video file after processing
                 await delete_file(video["file_path"])
             except Exception as e:
                 logger.error(f"Error processing video {video['id']} for order {order_id}: {e}")
                 
-                # Update video status to failed
                 await conn.execute(
                     "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     VideoStatus.FAILED, video["id"]
                 )
         
-        # Check if all videos are processed
         all_videos_processed = True
         videos_status = await conn.fetch(
             "SELECT status FROM videos WHERE order_id = $1", order_id
@@ -85,7 +129,6 @@ async def process_order(order_id: int):
                 all_videos_processed = False
                 break
         
-        # Update order status
         final_status = OrderStatus.COMPLETED if all_videos_processed else OrderStatus.FAILED
         await conn.execute(
             "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
@@ -94,14 +137,12 @@ async def process_order(order_id: int):
     except Exception as e:
         logger.error(f"Error processing order {order_id}: {e}")
         
-        # Update order status to failed
         if conn:
             await conn.execute(
                 "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                 OrderStatus.FAILED, order_id
             )
     finally:
-        # Close database connection
         if conn:
             await conn.close()
 
@@ -113,17 +154,14 @@ async def generate_subtitles(
 ) -> List[str]:
     """Generate subtitle files for a video using AI services"""
     try:
-        # Generate subtitles with AssemblyAI
         speech_subtitles = await generate_speech_subtitles(
             video["file_path"], config["source_language"]
         )
         
-        # Generate non-verbal sound subtitles with YAMNet
         sound_subtitles = await generate_sound_subtitles(
             video["file_path"], config["genre"]
         )
         
-        # Merge both subtitle types, filter and normalize as needed
         merged_subtitles = merge_subtitles(
             speech_subtitles, 
             sound_subtitles, 
@@ -131,14 +169,12 @@ async def generate_subtitles(
             config["non_verbal_only_mode"]
         )
         
-        # Format according to user preferences
         formatted_subtitles = format_subtitles(
             merged_subtitles,
             config["max_chars_per_line"],
             config["lines_per_subtitle"]
         )
         
-        # Translate non-verbal labels if needed
         if config["target_language"] and config["target_language"] != config["source_language"]:
             translated_subtitles = await translate_subtitles(
                 formatted_subtitles,
@@ -148,14 +184,11 @@ async def generate_subtitles(
         else:
             translated_subtitles = formatted_subtitles
         
-        # Export to requested format(s)
         subtitle_files = []
         output_format = config["output_format"]
         
-        # Determine output filename base
         filename_base = f"{os.path.splitext(video['original_filename'])[0]}"
         
-        # Export to the requested format
         output_file = export_subtitles(
             translated_subtitles,
             output_dir,
@@ -164,7 +197,6 @@ async def generate_subtitles(
         )
         subtitle_files.append(output_file)
         
-        # Save subtitle files to database
         for file_path in subtitle_files:
             await conn.execute("""
                 INSERT INTO subtitle_files (video_id, config_id, file_path, file_format)
@@ -177,48 +209,266 @@ async def generate_subtitles(
         raise
 
 async def generate_speech_subtitles(file_path: str, language: str) -> List[Dict]:
-    """
-    Generate speech subtitles using AssemblyAI API
-    This is a placeholder implementation - in production you would implement the actual API call
-    """
+    """Generate speech subtitles using AssemblyAI API"""
     try:
-        # Placeholder implementation
-        # In a real implementation, you would:
-        # 1. Upload the file to AssemblyAI
-        # 2. Start transcription job
-        # 3. Poll for completion
-        # 4. Get results and format as subtitles
+        if not os.path.exists(file_path) or os.path.getsize(file_path) < 1000:
+            logger.error(f"Video file not found or too small: {file_path}")
+            return []
         
-        # Simulated result
-        return [
-            {"start": 0, "end": 5000, "text": "This is sample speech text.", "type": "speech"},
-            {"start": 6000, "end": 10000, "text": "More sample text here.", "type": "speech"},
-        ]
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        audio_path = temp_file.name
+        temp_file.close()
+        
+        video = VideoFileClip(file_path)
+        audio = video.audio
+        audio.write_audiofile(audio_path, logger=None)
+        audio.close()
+        video.close()
+        
+        aai.settings.api_key = settings.ASSEMBLY_AI_API_KEY
+        transcriber = aai.Transcriber()
+        config = aai.TranscriptionConfig(
+            speech_model=aai.SpeechModel.slam_1,
+            language_code=language if language != 'auto' else None,
+            punctuate=True,
+            format_text=True
+        )
+        
+        transcript = transcriber.transcribe(audio_path, config)
+        
+        os.unlink(audio_path)
+        
+        if transcript.status == aai.TranscriptStatus.error:
+            logger.error(f"AssemblyAI transcription failed: {transcript.error}")
+            return []
+        
+        subtitles = []
+        if transcript.words:
+            for word_info in transcript.words:
+                subtitles.append({
+                    "start": word_info.start,
+                    "end": word_info.end,
+                    "text": word_info.text,
+                    "type": "speech"
+                })
+        
+        return merge_consecutive_words(subtitles) if subtitles else []
     except Exception as e:
         logger.error(f"Error generating speech subtitles: {e}")
-        raise
+        return []
 
 async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
-    """
-    Generate non-verbal sound subtitles using YAMNet
-    This is a placeholder implementation - in production you would implement the actual model usage
-    """
+    """Generate non-verbal sound subtitles using YAMNet"""
     try:
-        # Placeholder implementation
-        # In a real implementation, you would:
-        # 1. Extract audio from video
-        # 2. Run YAMNet model on audio segments
-        # 3. Identify sound events
-        # 4. Format as subtitles
+        logger.info(f"Starting sound detection for genre: {genre}")
         
-        # Simulated result
-        return [
-            {"start": 2500, "end": 3500, "text": "Door slamming", "type": "sound"},
-            {"start": 8000, "end": 9000, "text": "Footsteps", "type": "sound"},
-        ]
+        temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
+        audio_path = temp_file.name
+        temp_file.close()
+        
+        video = VideoFileClip(file_path)
+        audio = video.audio
+        audio.write_audiofile(audio_path, logger=None)
+        audio.close()
+        video.close()
+        
+        logger.info("Loading YAMNet model...")
+        yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
+        
+        audio_data, sample_rate = sf.read(audio_path)
+        logger.info(f"Audio loaded: {len(audio_data)} samples at {sample_rate}Hz")
+        
+        if len(audio_data.shape) > 1:
+            audio_data = np.mean(audio_data, axis=1)
+        
+        if sample_rate != 16000:
+            import scipy.signal
+            audio_data = scipy.signal.resample(audio_data, int(len(audio_data) * 16000 / sample_rate))
+            sample_rate = 16000
+            logger.info("Audio resampled to 16kHz")
+        
+        waveform = tf.cast(audio_data, tf.float32)
+        
+        segment_duration = 5.0
+        segment_samples = int(segment_duration * sample_rate)
+        
+        sound_events = []
+        total_segments = len(waveform) // segment_samples + 1
+        logger.info(f"Processing {total_segments} audio segments...")
+        
+        for segment_idx, start_sample in enumerate(range(0, len(waveform), segment_samples)):
+            end_sample = min(start_sample + segment_samples, len(waveform))
+            segment = waveform[start_sample:end_sample]
+            
+            if len(segment) < segment_samples:
+                padding = tf.zeros(segment_samples - len(segment))
+                segment = tf.concat([segment, padding], 0)
+            
+            scores, embeddings, spectrogram = yamnet_model(segment)
+            
+            class_names_path = yamnet_model.class_map_path().numpy().decode('utf-8')
+            with open(class_names_path, 'r') as f:
+                class_labels = [line.strip() for line in f.readlines()]
+            
+            top_class_indices = tf.argmax(scores, axis=1)
+            
+            for i, class_idx in enumerate(top_class_indices):
+                confidence = scores[i][class_idx].numpy()
+                if confidence > 0.2:  # Lower threshold to detect more sounds
+                    class_name = class_labels[class_idx]
+                    logger.info(f"Raw detection: {class_name} (confidence: {confidence:.2f})")
+                    normalized_label = normalize_sound_label(class_name)
+                    
+                    if normalized_label:
+                        logger.info(f"Normalized: {class_name} -> {normalized_label}")
+                        
+                        if should_include_sound(normalized_label, genre):
+                            start_time_ms = int((start_sample + i * 960) / sample_rate * 1000)
+                            end_time_ms = start_time_ms + 960
+                            
+                            sound_events.append({
+                                "start": start_time_ms,
+                                "end": end_time_ms,
+                                "text": normalized_label,
+                                "type": "sound",
+                                "confidence": float(confidence)
+                            })
+                            logger.info(f"Added sound event: {normalized_label} at {start_time_ms}ms")
+                        else:
+                            logger.info(f"Sound {normalized_label} filtered out by genre {genre}")
+                    else:
+                        logger.info(f"No normalized label found for: {class_name}")
+        
+        os.unlink(audio_path)
+        
+        logger.info(f"Sound detection completed. Found {len(sound_events)} events before deduplication.")
+        deduplicated_events = deduplicate_sound_events(sound_events)
+        logger.info(f"After deduplication: {len(deduplicated_events)} sound events")
+        
+        return deduplicated_events
     except Exception as e:
         logger.error(f"Error generating sound subtitles: {e}")
-        raise
+        return []
+
+
+
+def normalize_sound_label(yamnet_label: str) -> str:
+    """Normalize YAMNet labels to FCC-compliant format"""
+    yamnet_label_lower = yamnet_label.lower()
+    
+    # More comprehensive mapping
+    label_mappings = {
+        "speech": "Speech",
+        "music": "Music", 
+        "laughter": "Laughter",
+        "applause": "Applause",
+        "footsteps": "Footsteps",
+        "door": "Door slam",
+        "car": "Car engine",
+        "thunder": "Thunder",
+        "glass": "Glass breaking",
+        "gunshot": "Gunshot",
+        "explosion": "Explosion",
+        "scream": "Scream",
+        "whisper": "Whisper",
+        "breathing": "Breathing",
+        "heartbeat": "Heartbeat",
+        "cheer": "Cheering",
+        "knock": "Knocking",
+        "bell": "Bell ringing",
+        "phone": "Phone ringing",
+        "water": "Water sound",
+        "wind": "Wind",
+        "rain": "Rain",
+        "engine": "Engine",
+        "typing": "Typing",
+        "click": "Clicking",
+        "beep": "Beep",
+        "alarm": "Alarm",
+        "siren": "Siren"
+    }
+    
+    for key, normalized in label_mappings.items():
+        if key in yamnet_label_lower:
+            return f"[{normalized}]"
+    
+    # If no match found, return original with brackets for debugging
+    return f"[{yamnet_label}]"
+
+def should_include_sound(sound_label: str, genre: str) -> bool:
+    """Filter sounds based on genre preferences"""
+    if genre not in GENRE_SOUND_FILTERS:
+        logger.info(f"Genre {genre} not in filters, including all sounds")
+        return True
+    
+    filters = GENRE_SOUND_FILTERS[genre]
+    sound_key = sound_label.lower().replace('[', '').replace(']', '').replace(' ', '_')
+    
+    logger.info(f"Checking sound '{sound_key}' against genre '{genre}' filters")
+    
+    if sound_key in filters["blocked"]:
+        logger.info(f"Sound '{sound_key}' is blocked for genre '{genre}'")
+        return False
+    
+    if filters["allowed"] and sound_key not in filters["allowed"]:
+        logger.info(f"Sound '{sound_key}' not in allowed list for genre '{genre}'")
+        return False
+    
+    logger.info(f"Sound '{sound_key}' is allowed for genre '{genre}'")
+    return True
+
+def deduplicate_sound_events(events: List[Dict]) -> List[Dict]:
+    """Remove duplicate and overlapping sound events"""
+    if not events:
+        return []
+    
+    events.sort(key=lambda x: (x["start"], -x["confidence"]))
+    
+    deduplicated = []
+    for event in events:
+        should_add = True
+        for existing in deduplicated:
+            if (existing["text"] == event["text"] and 
+                existing["start"] <= event["start"] <= existing["end"]):
+                should_add = False
+                break
+        
+        if should_add:
+            deduplicated.append(event)
+    
+    return deduplicated
+
+def merge_consecutive_words(word_subtitles: List[Dict], max_duration_ms: int = 3000) -> List[Dict]:
+    """Merge consecutive words into phrases for better readability"""
+    if not word_subtitles:
+        return []
+    
+    merged = []
+    current_phrase = {
+        "start": word_subtitles[0]["start"],
+        "end": word_subtitles[0]["end"],
+        "text": word_subtitles[0]["text"],
+        "type": "speech"
+    }
+    
+    for i in range(1, len(word_subtitles)):
+        word = word_subtitles[i]
+        
+        if (word["start"] - current_phrase["end"] < 500 and 
+            word["end"] - current_phrase["start"] < max_duration_ms):
+            current_phrase["text"] += " " + word["text"]
+            current_phrase["end"] = word["end"]
+        else:
+            merged.append(current_phrase)
+            current_phrase = {
+                "start": word["start"],
+                "end": word["end"],
+                "text": word["text"],
+                "type": "speech"
+            }
+    
+    merged.append(current_phrase)
+    return merged
 
 def merge_subtitles(
     speech_subtitles: List[Dict],
@@ -230,29 +480,17 @@ def merge_subtitles(
     try:
         merged = []
         
-        # If non-verbal only mode is enabled, only include sound subtitles
         if non_verbal_only_mode:
-            for sub in sound_subtitles:
-                # Format non-verbal sounds with brackets
-                sub["text"] = f"[{sub['text']}]"
-                merged.append(sub)
-            return sorted(merged, key=lambda x: x["start"])
+            return sorted(sound_subtitles, key=lambda x: x["start"])
         
-        # Otherwise, include both speech and sound subtitles
         merged = speech_subtitles.copy()
         
         for sound_sub in sound_subtitles:
-            # Format non-verbal sounds with brackets
-            sound_sub["text"] = f"[{sound_sub['text']}]"
-            
-            # If accessibility mode is enabled, add all sound subtitles
             if accessibility_mode:
                 merged.append(sound_sub)
             else:
-                # Otherwise, only add sounds that don't overlap with speech
                 is_overlapping = False
                 for speech_sub in speech_subtitles:
-                    # Check for overlap
                     if (sound_sub["start"] <= speech_sub["end"] and 
                         sound_sub["end"] >= speech_sub["start"]):
                         is_overlapping = True
@@ -261,7 +499,6 @@ def merge_subtitles(
                 if not is_overlapping:
                     merged.append(sound_sub)
         
-        # Sort by start time
         return sorted(merged, key=lambda x: x["start"])
     except Exception as e:
         logger.error(f"Error merging subtitles: {e}")
@@ -277,21 +514,17 @@ def format_subtitles(
         formatted = []
         
         for sub in subtitles:
-            # If it's a non-verbal sound, keep as is
-            if sub["type"] == "sound" or sub["text"].startswith("["):
+            if sub["type"] == "sound":
                 formatted.append(sub)
                 continue
             
-            # For speech, format according to preferences
             text = sub["text"]
             max_chars = max_chars_per_line * lines_per_subtitle
             
-            # If text is already short enough, keep as is
             if len(text) <= max_chars:
                 formatted.append(sub)
                 continue
             
-            # Otherwise, split into multiple subtitle entries
             words = text.split()
             current_text = ""
             current_chars = 0
@@ -304,7 +537,6 @@ def format_subtitles(
                     current_text += word
                     current_chars += len(word)
                 else:
-                    # Create new subtitle entry
                     if current_text:
                         duration = sub["end"] - sub["start"]
                         chars_ratio = len(current_text) / len(text)
@@ -321,7 +553,6 @@ def format_subtitles(
                         current_text = word
                         current_chars = len(word)
             
-            # Add last part if any
             if current_text:
                 formatted.append({
                     "start": sub["start"],
@@ -330,7 +561,6 @@ def format_subtitles(
                     "type": "speech"
                 })
         
-        # Sort by start time
         return sorted(formatted, key=lambda x: x["start"])
     except Exception as e:
         logger.error(f"Error formatting subtitles: {e}")
@@ -341,22 +571,179 @@ async def translate_subtitles(
     source_language: str,
     target_language: str
 ) -> List[Dict]:
-    """
-    Translate subtitles to target language using DeepL or OpenAI
-    This is a placeholder implementation - in production you would implement the actual API calls
-    """
+    """Translate subtitles to target language using OpenAI GPT-4o in batches"""
     try:
-        # Placeholder implementation
-        # In a real implementation, you would:
-        # 1. Extract texts to translate
-        # 2. Call translation API (DeepL or OpenAI)
-        # 3. Replace texts with translations
+        if not settings.OPENAI_API_KEY:
+            logger.warning("No OpenAI API key available, skipping translation")
+            return subtitles
+            
+        if source_language == target_language:
+            logger.info("Source and target languages are the same, skipping translation")
+            return subtitles
         
-        # For this example, we'll just return the original subtitles
-        return subtitles
+        # Separate speech and sound subtitles
+        speech_subtitles = [sub for sub in subtitles if sub["type"] == "speech"]
+        sound_subtitles = [sub for sub in subtitles if sub["type"] == "sound"]
+        
+        translated_subtitles = []
+        
+        # Batch translate speech subtitles
+        if speech_subtitles:
+            logger.info(f"Translating {len(speech_subtitles)} speech subtitles in batch")
+            translated_speech = await batch_translate_speech(speech_subtitles, source_language, target_language)
+            translated_subtitles.extend(translated_speech)
+        
+        # Batch translate sound subtitles
+        if sound_subtitles:
+            logger.info(f"Translating {len(sound_subtitles)} sound subtitles in batch")
+            translated_sounds = await batch_translate_sounds(sound_subtitles, target_language)
+            translated_subtitles.extend(translated_sounds)
+        
+        # Sort by start time
+        translated_subtitles.sort(key=lambda x: x["start"])
+        
+        return translated_subtitles
     except Exception as e:
         logger.error(f"Error translating subtitles: {e}")
-        raise
+        return subtitles
+
+async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
+    """Translate text using OpenAI"""
+    try:
+        if settings.OPENAI_API_KEY:
+            return await translate_with_openai(text, source_lang, target_lang)
+        else:
+            return text
+    except Exception as e:
+        logger.error(f"Error translating text: {e}")
+        return text
+
+async def batch_translate_speech(speech_subtitles: List[Dict], source_lang: str, target_lang: str) -> List[Dict]:
+    """Batch translate speech subtitles using GPT-4o"""
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        
+        # Create numbered text list for batch translation
+        text_list = []
+        for i, sub in enumerate(speech_subtitles):
+            text_list.append(f"{i+1}. {sub['text']}")
+        
+        batch_text = "\n".join(text_list)
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"Translate the following numbered subtitle texts from {source_lang} to {target_lang}. Maintain the same numbering format. Only return the translated texts with their numbers."
+                },
+                {"role": "user", "content": batch_text}
+            ],
+            max_tokens=2000,
+            temperature=0.3
+        )
+        
+        translated_text = response.choices[0].message.content.strip()
+        
+        # Parse the translated response back into individual subtitles
+        translated_lines = translated_text.split('\n')
+        translated_subtitles = []
+        
+        for i, sub in enumerate(speech_subtitles):
+            # Find the corresponding translated line
+            translated_line = None
+            for line in translated_lines:
+                if line.strip().startswith(f"{i+1}."):
+                    translated_line = line.strip()[len(f"{i+1}."):].strip()
+                    break
+            
+            # If translation found, use it; otherwise keep original
+            translated_text = translated_line if translated_line else sub["text"]
+            
+            translated_subtitles.append({
+                **sub,
+                "text": translated_text
+            })
+        
+        return translated_subtitles
+    except Exception as e:
+        logger.error(f"Error in batch speech translation: {e}")
+        return speech_subtitles
+
+async def batch_translate_sounds(sound_subtitles: List[Dict], target_lang: str) -> List[Dict]:
+    """Batch translate sound subtitles using GPT-4o"""
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        
+        # Create numbered sound list for batch translation
+        sound_list = []
+        for i, sub in enumerate(sound_subtitles):
+            sound_list.append(f"{i+1}. {sub['text']}")
+        
+        batch_text = "\n".join(sound_list)
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"Translate the following numbered sound effect labels to {target_lang}. Keep the format [sound] with brackets. Maintain the same numbering format. Only return the translated sound labels with their numbers."
+                },
+                {"role": "user", "content": batch_text}
+            ],
+            max_tokens=1000,
+            temperature=0.3
+        )
+        
+        translated_text = response.choices[0].message.content.strip()
+        
+        # Parse the translated response back into individual subtitles
+        translated_lines = translated_text.split('\n')
+        translated_subtitles = []
+        
+        for i, sub in enumerate(sound_subtitles):
+            # Find the corresponding translated line
+            translated_line = None
+            for line in translated_lines:
+                if line.strip().startswith(f"{i+1}."):
+                    translated_line = line.strip()[len(f"{i+1}."):].strip()
+                    break
+            
+            # If translation found, use it; otherwise keep original
+            translated_text = translated_line if translated_line else sub["text"]
+            
+            translated_subtitles.append({
+                **sub,
+                "text": translated_text
+            })
+        
+        return translated_subtitles
+    except Exception as e:
+        logger.error(f"Error in batch sound translation: {e}")
+        return sound_subtitles
+
+async def translate_with_openai(text: str, source_lang: str, target_lang: str) -> str:
+    """Translate text using OpenAI API"""
+    try:
+        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
+        
+        response = await client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"Translate the following text from {source_lang} to {target_lang}. Only return the translation."
+                },
+                {"role": "user", "content": text}
+            ],
+            max_tokens=400,
+            temperature=0.3
+        )
+        
+        return response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Error with OpenAI translation: {e}")
+        return text
 
 def export_subtitles(
     subtitles: List[Dict],
@@ -386,7 +773,6 @@ def export_subtitles(
 def write_srt(file, subtitles: List[Dict]):
     """Write subtitles in SRT format"""
     for i, sub in enumerate(subtitles):
-        # Convert milliseconds to SRT time format (HH:MM:SS,mmm)
         start_time = format_srt_time(sub["start"])
         end_time = format_srt_time(sub["end"])
         
@@ -399,7 +785,6 @@ def write_vtt(file, subtitles: List[Dict]):
     file.write("WEBVTT\n\n")
     
     for i, sub in enumerate(subtitles):
-        # Convert milliseconds to WebVTT time format (HH:MM:SS.mmm)
         start_time = format_vtt_time(sub["start"])
         end_time = format_vtt_time(sub["end"])
         
@@ -423,7 +808,6 @@ def write_ass(file, subtitles: List[Dict]):
     file.write("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
     
     for sub in subtitles:
-        # Convert milliseconds to ASS time format (H:MM:SS.mm)
         start_time = format_ass_time(sub["start"])
         end_time = format_ass_time(sub["end"])
         
@@ -432,7 +816,6 @@ def write_ass(file, subtitles: List[Dict]):
 def write_txt(file, subtitles: List[Dict]):
     """Write subtitles in plain text format"""
     for sub in subtitles:
-        # Convert milliseconds to time format (HH:MM:SS)
         start_time = format_txt_time(sub["start"])
         
         file.write(f"[{start_time}] {sub['text']}\n")
@@ -456,7 +839,7 @@ def format_ass_time(ms: int) -> str:
     s, ms = divmod(ms, 1000)
     m, s = divmod(s, 60)
     h, m = divmod(m, 60)
-    cs = ms // 10  # Centiseconds
+    cs = ms // 10
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def format_txt_time(ms: int) -> str:

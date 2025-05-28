@@ -27,7 +27,6 @@ class Settings(BaseSettings):
     
     ASSEMBLY_AI_API_KEY: str = os.getenv("ASSEMBLY_AI_API_KEY", "")
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    DEEPL_API_KEY: str = os.getenv("DEEPL_API_KEY", "")
     
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "uploads")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")
