@@ -7,3 +7,5 @@ app/routes/__pycache__
 app/services/__pycache__
 uploads/
 outputs/
+cert.pem
+key.pem
