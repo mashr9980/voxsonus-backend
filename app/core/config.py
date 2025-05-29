@@ -26,7 +26,7 @@ class Settings(BaseSettings):
     STRIPE_WEBHOOK_SECRET: str = os.getenv("STRIPE_WEBHOOK_SECRET", "")
     
     ASSEMBLY_AI_API_KEY: str = os.getenv("ASSEMBLY_AI_API_KEY", "")
-    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "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")
     
     UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", "uploads")
     OUTPUT_DIR: str = os.getenv("OUTPUT_DIR", "outputs")

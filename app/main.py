@@ -19,14 +19,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=settings.ALLOWED_ORIGINS,
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
 @app.on_event("startup")
 async def startup_event():
     await create_tables()

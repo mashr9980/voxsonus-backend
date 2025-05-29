@@ -4,16 +4,15 @@ import asyncpg
 import os
 import json
 import logging
-import requests
-import time
 import tempfile
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from openai import AsyncOpenAI
 import tensorflow as tf
 import tensorflow_hub as hub
 import numpy as np
 import soundfile as sf
+import librosa
 import assemblyai as aai
 from moviepy.video.io.VideoFileClip import VideoFileClip
 from app.core.config import settings
@@ -22,56 +21,87 @@ from app.models.order import OrderStatus, VideoStatus, OutputFormat
 
 logger = logging.getLogger(__name__)
 
-# Genre-based sound filtering rules
-GENRE_SOUND_FILTERS = {
+SOUND_LABEL_PATTERNS = {
+    "speech": ["speech", "speak", "talk", "voice", "conversation", "dialogue"],
+    "music": ["music", "song", "melody", "musical", "instrument", "piano", "guitar", "drum"],
+    "laughter": ["laugh", "laughter", "giggle", "chuckle"],
+    "applause": ["applause", "clap", "clapping", "ovation"],
+    "footsteps": ["footstep", "footsteps", "walk", "step", "running", "jogging"],
+    "door": ["door", "slam", "opening", "closing", "knock", "knocking"],
+    "car": ["car", "vehicle", "engine", "motor", "automobile", "truck"],
+    "thunder": ["thunder", "storm", "lightning", "rumble"],
+    "glass": ["glass", "break", "shatter", "crash", "smash"],
+    "gunshot": ["gunshot", "gun", "shot", "fire", "shooting", "bullet"],
+    "explosion": ["explosion", "blast", "boom", "explode", "detonate"],
+    "scream": ["scream", "shout", "yell", "shriek", "cry"],
+    "whisper": ["whisper", "murmur", "quiet", "soft"],
+    "breathing": ["breath", "breathing", "inhale", "exhale", "gasp"],
+    "heartbeat": ["heartbeat", "heart", "pulse", "beat"],
+    "cheer": ["cheer", "cheering", "hooray", "celebration"],
+    "water": ["water", "splash", "drop", "rain", "pour"],
+    "wind": ["wind", "breeze", "gust", "blow"],
+    "bell": ["bell", "ring", "chime", "ding"],
+    "phone": ["phone", "telephone", "ring", "call"],
+    "typing": ["typing", "keyboard", "type", "click"],
+    "alarm": ["alarm", "alert", "siren", "warning"],
+    "animal": ["dog", "cat", "bird", "bark", "meow", "chirp", "animal"],
+    "crowd": ["crowd", "people", "audience", "group"],
+    "impact": ["hit", "punch", "slap", "bang", "thud"],
+    "mechanical": ["mechanical", "machine", "beep", "buzz", "whir"],
+    "fire": ["fire", "crackle", "burn", "flame"],
+    "electronic": ["electronic", "digital", "beep", "bleep", "signal"]
+}
+
+GENRE_FILTERS = {
     "horror": {
-        "allowed": ["scream", "thunder", "door_slam", "footsteps", "whisper", "breathing", "heartbeat", "glass_break", "gunshot", "explosion"],
-        "blocked": ["laughter", "applause", "music", "cheer"]
+        "priority": ["scream", "thunder", "footsteps", "door", "breathing", "heartbeat", "whisper", "glass", "impact"],
+        "allowed": ["scream", "thunder", "footsteps", "door", "breathing", "heartbeat", "whisper", "glass", "impact", "wind", "animal", "mechanical", "fire"],
+        "blocked": ["laughter", "applause", "cheer", "music"]
     },
     "comedy": {
-        "allowed": ["laughter", "applause", "cheer", "music", "footsteps", "door_slam"],
-        "blocked": ["scream", "gunshot", "explosion", "thunder"]
+        "priority": ["laughter", "applause", "cheer", "impact", "footsteps"],
+        "allowed": ["laughter", "applause", "cheer", "music", "footsteps", "door", "impact", "crowd", "animal"],
+        "blocked": ["scream", "gunshot", "explosion", "thunder", "breathing", "heartbeat"]
     },
     "romance": {
-        "allowed": ["music", "whisper", "breathing", "footsteps", "door_slam", "laughter"],
-        "blocked": ["gunshot", "explosion", "scream", "thunder"]
+        "priority": ["music", "whisper", "breathing", "heartbeat", "footsteps"],
+        "allowed": ["music", "whisper", "breathing", "heartbeat", "footsteps", "door", "laughter", "water", "wind", "bell"],
+        "blocked": ["gunshot", "explosion", "scream", "thunder", "glass", "impact", "alarm"]
     },
     "action": {
-        "allowed": ["gunshot", "explosion", "footsteps", "car_engine", "door_slam", "glass_break", "thunder"],
-        "blocked": ["whisper", "breathing", "laughter"]
+        "priority": ["gunshot", "explosion", "car", "footsteps", "door", "glass", "impact"],
+        "allowed": ["gunshot", "explosion", "footsteps", "car", "door", "glass", "impact", "thunder", "mechanical", "crowd", "alarm"],
+        "blocked": ["whisper", "breathing", "heartbeat", "laughter", "music"]
     },
     "documentary": {
-        "allowed": ["footsteps", "door_slam", "car_engine", "music", "applause"],
-        "blocked": ["scream", "gunshot", "explosion"]
+        "priority": ["footsteps", "door", "car", "music", "applause", "crowd"],
+        "allowed": ["footsteps", "door", "car", "music", "applause", "water", "wind", "animal", "crowd", "bell", "mechanical"],
+        "blocked": ["scream", "gunshot", "explosion", "thunder", "glass"]
+    },
+    "drama": {
+        "priority": ["footsteps", "door", "breathing", "whisper", "music", "car"],
+        "allowed": ["footsteps", "door", "breathing", "whisper", "music", "car", "phone", "typing", "crowd", "water", "wind"],
+        "blocked": ["explosion", "gunshot", "scream", "thunder"]
+    },
+    "thriller": {
+        "priority": ["footsteps", "door", "breathing", "heartbeat", "phone", "car"],
+        "allowed": ["footsteps", "door", "breathing", "heartbeat", "phone", "car", "whisper", "glass", "impact", "mechanical", "alarm"],
+        "blocked": ["laughter", "applause", "cheer", "music"]
     },
     "general": {
-        "allowed": ["footsteps", "door_slam", "laughter", "applause", "music", "car_engine"],
+        "priority": ["footsteps", "door", "laughter", "applause", "music", "car"],
+        "allowed": ["footsteps", "door", "laughter", "applause", "music", "car", "phone", "bell", "crowd", "animal", "water", "wind"],
         "blocked": []
     }
 }
 
-# YAMNet label to normalized format mapping
-YAMNET_LABEL_MAPPING = {
-    "Speech": "Speech",
-    "Music": "Music",
-    "Laughter": "Laughter",
-    "Applause": "Applause",
-    "Footsteps": "Footsteps",
-    "Door": "Door slam",
-    "Car": "Car engine",
-    "Thunder": "Thunder",
-    "Glass": "Glass breaking",
-    "Gunshot": "Gunshot",
-    "Explosion": "Explosion", 
-    "Scream": "Scream",
-    "Whisper": "Whisper",
-    "Breathing": "Breathing",
-    "Heartbeat": "Heartbeat",
-    "Cheer": "Cheering"
+TRANSLATION_CONFIG = {
+    "max_words_per_batch": 500,
+    "max_subtitles_per_batch": 50,
+    "max_tokens": 2000,
 }
 
 async def process_order(order_id: int):
-    """Process a paid order by generating subtitles for all videos"""
     conn = None
     try:
         conn = await asyncpg.connect(settings.DATABASE_URL)
@@ -112,8 +142,6 @@ async def process_order(order_id: int):
                 
                 await delete_file(video["file_path"])
             except Exception as e:
-                logger.error(f"Error processing video {video['id']} for order {order_id}: {e}")
-                
                 await conn.execute(
                     "UPDATE videos SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
                     VideoStatus.FAILED, video["id"]
@@ -135,8 +163,6 @@ async def process_order(order_id: int):
             final_status, order_id
         )
     except Exception as e:
-        logger.error(f"Error processing order {order_id}: {e}")
-        
         if conn:
             await conn.execute(
                 "UPDATE orders SET status = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
@@ -152,7 +178,6 @@ async def generate_subtitles(
     output_dir: str,
     conn: asyncpg.Connection
 ) -> List[str]:
-    """Generate subtitle files for a video using AI services"""
     try:
         speech_subtitles = await generate_speech_subtitles(
             video["file_path"], config["source_language"]
@@ -205,14 +230,11 @@ async def generate_subtitles(
         
         return subtitle_files
     except Exception as e:
-        logger.error(f"Error generating subtitles: {e}")
         raise
 
 async def generate_speech_subtitles(file_path: str, language: str) -> List[Dict]:
-    """Generate speech subtitles using AssemblyAI API"""
     try:
         if not os.path.exists(file_path) or os.path.getsize(file_path) < 1000:
-            logger.error(f"Video file not found or too small: {file_path}")
             return []
         
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
@@ -239,7 +261,6 @@ async def generate_speech_subtitles(file_path: str, language: str) -> List[Dict]
         os.unlink(audio_path)
         
         if transcript.status == aai.TranscriptStatus.error:
-            logger.error(f"AssemblyAI transcription failed: {transcript.error}")
             return []
         
         subtitles = []
@@ -254,14 +275,10 @@ async def generate_speech_subtitles(file_path: str, language: str) -> List[Dict]
         
         return merge_consecutive_words(subtitles) if subtitles else []
     except Exception as e:
-        logger.error(f"Error generating speech subtitles: {e}")
         return []
 
 async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
-    """Generate non-verbal sound subtitles using YAMNet"""
     try:
-        logger.info(f"Starting sound detection for genre: {genre}")
-        
         temp_file = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
         audio_path = temp_file.name
         temp_file.close()
@@ -272,11 +289,22 @@ async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
         audio.close()
         video.close()
         
-        logger.info("Loading YAMNet model...")
+        yamnet_events = await analyze_with_yamnet(audio_path, genre)
+        librosa_events = await analyze_with_librosa(audio_path, genre)
+        
+        combined_events = combine_sound_events(yamnet_events, librosa_events, genre)
+        
+        os.unlink(audio_path)
+        
+        return combined_events
+    except Exception as e:
+        return []
+
+async def analyze_with_yamnet(audio_path: str, genre: str) -> List[Dict]:
+    try:
         yamnet_model = hub.load('https://tfhub.dev/google/yamnet/1')
         
         audio_data, sample_rate = sf.read(audio_path)
-        logger.info(f"Audio loaded: {len(audio_data)} samples at {sample_rate}Hz")
         
         if len(audio_data.shape) > 1:
             audio_data = np.mean(audio_data, axis=1)
@@ -285,16 +313,24 @@ async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
             import scipy.signal
             audio_data = scipy.signal.resample(audio_data, int(len(audio_data) * 16000 / sample_rate))
             sample_rate = 16000
-            logger.info("Audio resampled to 16kHz")
         
         waveform = tf.cast(audio_data, tf.float32)
         
-        segment_duration = 5.0
+        segment_duration = 2.0
         segment_samples = int(segment_duration * sample_rate)
         
         sound_events = []
-        total_segments = len(waveform) // segment_samples + 1
-        logger.info(f"Processing {total_segments} audio segments...")
+        
+        class_map_path = yamnet_model.class_map_path().numpy()
+        class_names = []
+        try:
+            with tf.io.gfile.GFile(class_map_path.decode('utf-8')) as csvfile:
+                import csv
+                reader = csv.DictReader(csvfile)
+                for row in reader:
+                    class_names.append(row['display_name'])
+        except Exception as e:
+            return []
         
         for segment_idx, start_sample in enumerate(range(0, len(waveform), segment_samples)):
             end_sample = min(start_sample + segment_samples, len(waveform))
@@ -306,24 +342,18 @@ async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
             
             scores, embeddings, spectrogram = yamnet_model(segment)
             
-            class_names_path = yamnet_model.class_map_path().numpy().decode('utf-8')
-            with open(class_names_path, 'r') as f:
-                class_labels = [line.strip() for line in f.readlines()]
-            
-            top_class_indices = tf.argmax(scores, axis=1)
-            
-            for i, class_idx in enumerate(top_class_indices):
-                confidence = scores[i][class_idx].numpy()
-                if confidence > 0.2:  # Lower threshold to detect more sounds
-                    class_name = class_labels[class_idx]
-                    logger.info(f"Raw detection: {class_name} (confidence: {confidence:.2f})")
-                    normalized_label = normalize_sound_label(class_name)
-                    
-                    if normalized_label:
-                        logger.info(f"Normalized: {class_name} -> {normalized_label}")
+            for frame_idx in range(scores.shape[0]):
+                frame_scores = scores[frame_idx]
+                top_indices = tf.nn.top_k(frame_scores, k=5).indices
+                
+                for class_idx in top_indices:
+                    confidence = frame_scores[class_idx].numpy()
+                    if confidence > 0.25:
+                        class_name = class_names[class_idx]
+                        normalized_label = normalize_sound_label(class_name)
                         
-                        if should_include_sound(normalized_label, genre):
-                            start_time_ms = int((start_sample + i * 960) / sample_rate * 1000)
+                        if normalized_label and should_include_sound(normalized_label, genre):
+                            start_time_ms = int((start_sample + frame_idx * 480) / sample_rate * 1000)
                             end_time_ms = start_time_ms + 960
                             
                             sound_events.append({
@@ -331,36 +361,111 @@ async def generate_sound_subtitles(file_path: str, genre: str) -> List[Dict]:
                                 "end": end_time_ms,
                                 "text": normalized_label,
                                 "type": "sound",
-                                "confidence": float(confidence)
+                                "confidence": float(confidence),
+                                "source": "yamnet"
                             })
-                            logger.info(f"Added sound event: {normalized_label} at {start_time_ms}ms")
-                        else:
-                            logger.info(f"Sound {normalized_label} filtered out by genre {genre}")
-                    else:
-                        logger.info(f"No normalized label found for: {class_name}")
         
-        os.unlink(audio_path)
-        
-        logger.info(f"Sound detection completed. Found {len(sound_events)} events before deduplication.")
-        deduplicated_events = deduplicate_sound_events(sound_events)
-        logger.info(f"After deduplication: {len(deduplicated_events)} sound events")
-        
-        return deduplicated_events
+        return sound_events
     except Exception as e:
-        logger.error(f"Error generating sound subtitles: {e}")
         return []
 
+async def analyze_with_librosa(audio_path: str, genre: str) -> List[Dict]:
+    try:
+        y, sr = librosa.load(audio_path, sr=22050)
+        
+        hop_length = 512
+        
+        onset_frames = librosa.onset.onset_detect(y=y, sr=sr, hop_length=hop_length, 
+                                                  delta=0.2, units='frames')
+        onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=hop_length)
+        
+        rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
+        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
+        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr, hop_length=hop_length)[0]
+        zcr = librosa.feature.zero_crossing_rate(y, hop_length=hop_length)[0]
+        
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, hop_length=hop_length)
+        beat_times = librosa.frames_to_time(beats, sr=sr, hop_length=hop_length)
+        
+        sound_events = []
+        
+        for onset_time in onset_times:
+            frame_idx = int(onset_time * sr / hop_length)
+            if frame_idx < len(rms):
+                energy = rms[frame_idx]
+                centroid = spectral_centroids[frame_idx] if frame_idx < len(spectral_centroids) else 0
+                rolloff = spectral_rolloff[frame_idx] if frame_idx < len(spectral_rolloff) else 0
+                zero_cross = zcr[frame_idx] if frame_idx < len(zcr) else 0
+                
+                sound_type = classify_onset_type(energy, centroid, rolloff, zero_cross, tempo)
+                
+                if sound_type and should_include_sound(sound_type, genre):
+                    start_time_ms = int(onset_time * 1000)
+                    end_time_ms = start_time_ms + 1000
+                    
+                    sound_events.append({
+                        "start": start_time_ms,
+                        "end": end_time_ms,
+                        "text": sound_type,
+                        "type": "sound",
+                        "confidence": min(energy * 2, 1.0),
+                        "source": "librosa"
+                    })
+        
+        if tempo > 80 and should_include_sound("[Music]", genre):
+            for beat_time in beat_times[:10]:
+                start_time_ms = int(beat_time * 1000)
+                end_time_ms = start_time_ms + 500
+                
+                sound_events.append({
+                    "start": start_time_ms,
+                    "end": end_time_ms,
+                    "text": "[Music]",
+                    "type": "sound",
+                    "confidence": 0.8,
+                    "source": "librosa"
+                })
+        
+        return sound_events
+    except Exception as e:
+        return []
 
+def classify_onset_type(energy, centroid, rolloff, zcr, tempo):
+    if energy > 0.1:
+        if centroid > 3000 and zcr > 0.1:
+            return "[Glass breaking]"
+        elif centroid > 2500 and energy > 0.3:
+            return "[Door slam]"
+        elif centroid < 1000 and energy > 0.4:
+            return "[Explosion]"
+        elif zcr > 0.15:
+            return "[Applause]"
+        elif centroid > 1500 and energy > 0.2:
+            return "[Footsteps]"
+        elif centroid < 500 and energy > 0.25:
+            return "[Thunder]"
+        else:
+            return "[Impact sound]"
+    return None
 
-def normalize_sound_label(yamnet_label: str) -> str:
-    """Normalize YAMNet labels to FCC-compliant format"""
-    yamnet_label_lower = yamnet_label.lower()
+def normalize_sound_label(raw_label: str) -> Optional[str]:
+    if not raw_label or raw_label.strip() == "":
+        return None
     
-    # More comprehensive mapping
-    label_mappings = {
+    raw_lower = raw_label.lower().strip()
+    
+    for sound_type, patterns in SOUND_LABEL_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in raw_lower:
+                return format_sound_label(sound_type, raw_label)
+    
+    return format_sound_label("unknown", raw_label)
+
+def format_sound_label(sound_type: str, original_label: str) -> str:
+    label_formats = {
         "speech": "Speech",
-        "music": "Music", 
-        "laughter": "Laughter",
+        "music": "Music",
+        "laughter": "Laughter", 
         "applause": "Applause",
         "footsteps": "Footsteps",
         "door": "Door slam",
@@ -374,72 +479,98 @@ def normalize_sound_label(yamnet_label: str) -> str:
         "breathing": "Breathing",
         "heartbeat": "Heartbeat",
         "cheer": "Cheering",
-        "knock": "Knocking",
-        "bell": "Bell ringing",
-        "phone": "Phone ringing",
         "water": "Water sound",
         "wind": "Wind",
-        "rain": "Rain",
-        "engine": "Engine",
+        "bell": "Bell ringing",
+        "phone": "Phone ringing",
         "typing": "Typing",
-        "click": "Clicking",
-        "beep": "Beep",
         "alarm": "Alarm",
-        "siren": "Siren"
+        "animal": "Animal sound",
+        "crowd": "Crowd noise",
+        "impact": "Impact sound",
+        "mechanical": "Mechanical sound",
+        "fire": "Fire crackling",
+        "electronic": "Electronic sound",
+        "unknown": original_label
     }
     
-    for key, normalized in label_mappings.items():
-        if key in yamnet_label_lower:
-            return f"[{normalized}]"
-    
-    # If no match found, return original with brackets for debugging
-    return f"[{yamnet_label}]"
+    formatted = label_formats.get(sound_type, original_label)
+    return f"[{formatted}]"
 
 def should_include_sound(sound_label: str, genre: str) -> bool:
-    """Filter sounds based on genre preferences"""
-    if genre not in GENRE_SOUND_FILTERS:
-        logger.info(f"Genre {genre} not in filters, including all sounds")
+    if genre not in GENRE_FILTERS:
         return True
     
-    filters = GENRE_SOUND_FILTERS[genre]
-    sound_key = sound_label.lower().replace('[', '').replace(']', '').replace(' ', '_')
-    
-    logger.info(f"Checking sound '{sound_key}' against genre '{genre}' filters")
-    
-    if sound_key in filters["blocked"]:
-        logger.info(f"Sound '{sound_key}' is blocked for genre '{genre}'")
+    sound_key = extract_sound_key(sound_label)
+    if not sound_key:
         return False
     
-    if filters["allowed"] and sound_key not in filters["allowed"]:
-        logger.info(f"Sound '{sound_key}' not in allowed list for genre '{genre}'")
+    filters = GENRE_FILTERS[genre]
+    
+    if sound_key in filters.get("blocked", []):
         return False
     
-    logger.info(f"Sound '{sound_key}' is allowed for genre '{genre}'")
+    allowed_sounds = filters.get("allowed", [])
+    if allowed_sounds and sound_key not in allowed_sounds:
+        return False
+    
     return True
 
+def extract_sound_key(sound_label: str) -> Optional[str]:
+    clean_label = sound_label.lower().replace('[', '').replace(']', '').strip()
+    
+    for sound_type, patterns in SOUND_LABEL_PATTERNS.items():
+        for pattern in patterns:
+            if pattern in clean_label:
+                return sound_type
+    
+    return None
+
+def get_sound_priority(sound_label: str, genre: str) -> int:
+    sound_key = extract_sound_key(sound_label)
+    if not sound_key or genre not in GENRE_FILTERS:
+        return 0
+    
+    priority_sounds = GENRE_FILTERS[genre].get("priority", [])
+    if sound_key in priority_sounds:
+        return priority_sounds.index(sound_key) + 10
+    
+    return 1
+
+def combine_sound_events(yamnet_events: List[Dict], librosa_events: List[Dict], genre: str) -> List[Dict]:
+    all_events = yamnet_events + librosa_events
+    
+    for event in all_events:
+        event["priority"] = get_sound_priority(event["text"], genre)
+    
+    return deduplicate_sound_events(all_events)
+
 def deduplicate_sound_events(events: List[Dict]) -> List[Dict]:
-    """Remove duplicate and overlapping sound events"""
     if not events:
         return []
     
-    events.sort(key=lambda x: (x["start"], -x["confidence"]))
+    events.sort(key=lambda x: (x["start"], -x.get("priority", 0), -x["confidence"]))
     
     deduplicated = []
     for event in events:
         should_add = True
         for existing in deduplicated:
             if (existing["text"] == event["text"] and 
-                existing["start"] <= event["start"] <= existing["end"]):
-                should_add = False
+                abs(existing["start"] - event["start"]) < 1500):
+                if (event.get("priority", 0) > existing.get("priority", 0) or 
+                    (event.get("priority", 0) == existing.get("priority", 0) and 
+                     event["confidence"] > existing["confidence"])):
+                    deduplicated.remove(existing)
+                else:
+                    should_add = False
                 break
         
         if should_add:
             deduplicated.append(event)
     
-    return deduplicated
+    return sorted(deduplicated, key=lambda x: x["start"])
 
 def merge_consecutive_words(word_subtitles: List[Dict], max_duration_ms: int = 3000) -> List[Dict]:
-    """Merge consecutive words into phrases for better readability"""
     if not word_subtitles:
         return []
     
@@ -476,7 +607,6 @@ def merge_subtitles(
     accessibility_mode: bool,
     non_verbal_only_mode: bool
 ) -> List[Dict]:
-    """Merge speech and sound subtitles according to user preferences"""
     try:
         merged = []
         
@@ -501,7 +631,6 @@ def merge_subtitles(
         
         return sorted(merged, key=lambda x: x["start"])
     except Exception as e:
-        logger.error(f"Error merging subtitles: {e}")
         raise
 
 def format_subtitles(
@@ -509,7 +638,6 @@ def format_subtitles(
     max_chars_per_line: int,
     lines_per_subtitle: int
 ) -> List[Dict]:
-    """Format subtitles according to user preferences"""
     try:
         formatted = []
         
@@ -563,7 +691,6 @@ def format_subtitles(
         
         return sorted(formatted, key=lambda x: x["start"])
     except Exception as e:
-        logger.error(f"Error formatting subtitles: {e}")
         raise
 
 async def translate_subtitles(
@@ -571,179 +698,173 @@ async def translate_subtitles(
     source_language: str,
     target_language: str
 ) -> List[Dict]:
-    """Translate subtitles to target language using OpenAI GPT-4o in batches"""
     try:
         if not settings.OPENAI_API_KEY:
-            logger.warning("No OpenAI API key available, skipping translation")
             return subtitles
             
         if source_language == target_language:
-            logger.info("Source and target languages are the same, skipping translation")
             return subtitles
         
-        # Separate speech and sound subtitles
         speech_subtitles = [sub for sub in subtitles if sub["type"] == "speech"]
         sound_subtitles = [sub for sub in subtitles if sub["type"] == "sound"]
         
         translated_subtitles = []
         
-        # Batch translate speech subtitles
         if speech_subtitles:
-            logger.info(f"Translating {len(speech_subtitles)} speech subtitles in batch")
-            translated_speech = await batch_translate_speech(speech_subtitles, source_language, target_language)
+            translated_speech = await translate_texts_in_batches(
+                speech_subtitles, source_language, target_language, "speech"
+            )
             translated_subtitles.extend(translated_speech)
         
-        # Batch translate sound subtitles
         if sound_subtitles:
-            logger.info(f"Translating {len(sound_subtitles)} sound subtitles in batch")
-            translated_sounds = await batch_translate_sounds(sound_subtitles, target_language)
+            translated_sounds = await translate_texts_in_batches(
+                sound_subtitles, source_language, target_language, "sound"
+            )
             translated_subtitles.extend(translated_sounds)
         
-        # Sort by start time
         translated_subtitles.sort(key=lambda x: x["start"])
         
         return translated_subtitles
     except Exception as e:
-        logger.error(f"Error translating subtitles: {e}")
         return subtitles
 
-async def translate_text(text: str, source_lang: str, target_lang: str) -> str:
-    """Translate text using OpenAI"""
+async def translate_texts_in_batches(
+    subtitles: List[Dict], 
+    source_lang: str, 
+    target_lang: str, 
+    subtitle_type: str
+) -> List[Dict]:
     try:
-        if settings.OPENAI_API_KEY:
-            return await translate_with_openai(text, source_lang, target_lang)
-        else:
-            return text
-    except Exception as e:
-        logger.error(f"Error translating text: {e}")
-        return text
-
-async def batch_translate_speech(speech_subtitles: List[Dict], source_lang: str, target_lang: str) -> List[Dict]:
-    """Batch translate speech subtitles using GPT-4o"""
-    try:
+        if not subtitles:
+            return []
+        
         client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        
-        # Create numbered text list for batch translation
-        text_list = []
-        for i, sub in enumerate(speech_subtitles):
-            text_list.append(f"{i+1}. {sub['text']}")
-        
-        batch_text = "\n".join(text_list)
-        
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"Translate the following numbered subtitle texts from {source_lang} to {target_lang}. Maintain the same numbering format. Only return the translated texts with their numbers."
-                },
-                {"role": "user", "content": batch_text}
-            ],
-            max_tokens=2000,
-            temperature=0.3
-        )
-        
-        translated_text = response.choices[0].message.content.strip()
-        
-        # Parse the translated response back into individual subtitles
-        translated_lines = translated_text.split('\n')
         translated_subtitles = []
         
-        for i, sub in enumerate(speech_subtitles):
-            # Find the corresponding translated line
+        batches = create_smart_batches(subtitles)
+        
+        for batch_idx, batch in enumerate(batches):
+            try:
+                text_items = []
+                for i, sub in enumerate(batch):
+                    text_items.append(f"{i + 1}. {sub['text']}")
+                
+                batch_text = "\n".join(text_items)
+                
+                if subtitle_type == "speech":
+                    system_message = (
+                        f"Translate the following numbered subtitle texts from {source_lang} to {target_lang}. "
+                        f"Maintain the same numbering format and preserve the meaning accurately. "
+                        f"Only return the translated texts with their numbers, nothing else."
+                    )
+                else:
+                    system_message = (
+                        f"Translate the following numbered sound effect labels from {source_lang} to {target_lang}. "
+                        f"Keep the format [sound] with brackets. Maintain the same numbering format. "
+                        f"Only return the translated sound labels with their numbers, nothing else."
+                    )
+                
+                response = await make_translation_request(
+                    client, system_message, batch_text, batch_idx
+                )
+                
+                if response:
+                    batch_translations = parse_translation_response(response, batch)
+                    translated_subtitles.extend(batch_translations)
+                else:
+                    translated_subtitles.extend(batch)
+                
+                if batch_idx < len(batches) - 1:
+                    await asyncio.sleep(0.1)
+                    
+            except Exception as e:
+                translated_subtitles.extend(batch)
+        
+        return translated_subtitles
+        
+    except Exception as e:
+        return subtitles
+
+def create_smart_batches(subtitles: List[Dict]) -> List[List[Dict]]:
+    batches = []
+    current_batch = []
+    current_word_count = 0
+    
+    max_words = TRANSLATION_CONFIG["max_words_per_batch"]
+    max_subtitles = TRANSLATION_CONFIG["max_subtitles_per_batch"]
+    
+    for subtitle in subtitles:
+        text = subtitle["text"]
+        word_count = len(text.split())
+        
+        if (current_word_count + word_count > max_words or 
+            len(current_batch) >= max_subtitles) and current_batch:
+            
+            batches.append(current_batch)
+            current_batch = []
+            current_word_count = 0
+        
+        current_batch.append(subtitle)
+        current_word_count += word_count
+    
+    if current_batch:
+        batches.append(current_batch)
+    
+    return batches
+
+async def make_translation_request(
+    client: AsyncOpenAI, 
+    system_message: str, 
+    batch_text: str, 
+    batch_idx: int,
+    max_retries: int = 3
+) -> str:
+    for attempt in range(max_retries):
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": batch_text}
+                ],
+                max_tokens=TRANSLATION_CONFIG["max_tokens"],
+                temperature=0.3,
+                timeout=30.0
+            )
+            
+            return response.choices[0].message.content.strip()
+            
+        except Exception as e:
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)
+            else:
+                return None
+
+def parse_translation_response(translated_text: str, original_batch: List[Dict]) -> List[Dict]:
+    try:
+        translated_lines = [line.strip() for line in translated_text.split('\n') if line.strip()]
+        translated_subtitles = []
+        
+        for i, original_sub in enumerate(original_batch):
             translated_line = None
+            expected_prefix = f"{i + 1}."
+            
             for line in translated_lines:
-                if line.strip().startswith(f"{i+1}."):
-                    translated_line = line.strip()[len(f"{i+1}."):].strip()
+                if line.startswith(expected_prefix):
+                    translated_line = line[len(expected_prefix):].strip()
                     break
             
-            # If translation found, use it; otherwise keep original
-            translated_text = translated_line if translated_line else sub["text"]
+            final_text = translated_line if translated_line else original_sub["text"]
             
             translated_subtitles.append({
-                **sub,
-                "text": translated_text
+                **original_sub,
+                "text": final_text
             })
         
         return translated_subtitles
+        
     except Exception as e:
-        logger.error(f"Error in batch speech translation: {e}")
-        return speech_subtitles
-
-async def batch_translate_sounds(sound_subtitles: List[Dict], target_lang: str) -> List[Dict]:
-    """Batch translate sound subtitles using GPT-4o"""
-    try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        
-        # Create numbered sound list for batch translation
-        sound_list = []
-        for i, sub in enumerate(sound_subtitles):
-            sound_list.append(f"{i+1}. {sub['text']}")
-        
-        batch_text = "\n".join(sound_list)
-        
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"Translate the following numbered sound effect labels to {target_lang}. Keep the format [sound] with brackets. Maintain the same numbering format. Only return the translated sound labels with their numbers."
-                },
-                {"role": "user", "content": batch_text}
-            ],
-            max_tokens=1000,
-            temperature=0.3
-        )
-        
-        translated_text = response.choices[0].message.content.strip()
-        
-        # Parse the translated response back into individual subtitles
-        translated_lines = translated_text.split('\n')
-        translated_subtitles = []
-        
-        for i, sub in enumerate(sound_subtitles):
-            # Find the corresponding translated line
-            translated_line = None
-            for line in translated_lines:
-                if line.strip().startswith(f"{i+1}."):
-                    translated_line = line.strip()[len(f"{i+1}."):].strip()
-                    break
-            
-            # If translation found, use it; otherwise keep original
-            translated_text = translated_line if translated_line else sub["text"]
-            
-            translated_subtitles.append({
-                **sub,
-                "text": translated_text
-            })
-        
-        return translated_subtitles
-    except Exception as e:
-        logger.error(f"Error in batch sound translation: {e}")
-        return sound_subtitles
-
-async def translate_with_openai(text: str, source_lang: str, target_lang: str) -> str:
-    """Translate text using OpenAI API"""
-    try:
-        client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-        
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"Translate the following text from {source_lang} to {target_lang}. Only return the translation."
-                },
-                {"role": "user", "content": text}
-            ],
-            max_tokens=400,
-            temperature=0.3
-        )
-        
-        return response.choices[0].message.content.strip()
-    except Exception as e:
-        logger.error(f"Error with OpenAI translation: {e}")
-        return text
+        return original_batch
 
 def export_subtitles(
     subtitles: List[Dict],
@@ -751,7 +872,6 @@ def export_subtitles(
     filename_base: str,
     output_format: str
 ) -> str:
-    """Export subtitles to the requested format"""
     try:
         output_file = os.path.join(output_dir, f"{filename_base}.{output_format}")
         
@@ -767,11 +887,9 @@ def export_subtitles(
         
         return output_file
     except Exception as e:
-        logger.error(f"Error exporting subtitles: {e}")
         raise
 
 def write_srt(file, subtitles: List[Dict]):
-    """Write subtitles in SRT format"""
     for i, sub in enumerate(subtitles):
         start_time = format_srt_time(sub["start"])
         end_time = format_srt_time(sub["end"])
@@ -781,7 +899,6 @@ def write_srt(file, subtitles: List[Dict]):
         file.write(f"{sub['text']}\n\n")
 
 def write_vtt(file, subtitles: List[Dict]):
-    """Write subtitles in WebVTT format"""
     file.write("WEBVTT\n\n")
     
     for i, sub in enumerate(subtitles):
@@ -793,7 +910,6 @@ def write_vtt(file, subtitles: List[Dict]):
         file.write(f"{sub['text']}\n\n")
 
 def write_ass(file, subtitles: List[Dict]):
-    """Write subtitles in Advanced SubStation Alpha format"""
     file.write("[Script Info]\n")
     file.write("Title: Generated Subtitles\n")
     file.write("ScriptType: v4.00+\n")
@@ -814,28 +930,24 @@ def write_ass(file, subtitles: List[Dict]):
         file.write(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{sub['text']}\n")
 
 def write_txt(file, subtitles: List[Dict]):
-    """Write subtitles in plain text format"""
     for sub in subtitles:
         start_time = format_txt_time(sub["start"])
         
         file.write(f"[{start_time}] {sub['text']}\n")
 
 def format_srt_time(ms: int) -> str:
-    """Format milliseconds as SRT time (HH:MM:SS,mmm)"""
     s, ms = divmod(ms, 1000)
     m, s = divmod(s, 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 def format_vtt_time(ms: int) -> str:
-    """Format milliseconds as WebVTT time (HH:MM:SS.mmm)"""
     s, ms = divmod(ms, 1000)
     m, s = divmod(s, 60)
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
 
 def format_ass_time(ms: int) -> str:
-    """Format milliseconds as ASS time (H:MM:SS.mm)"""
     s, ms = divmod(ms, 1000)
     m, s = divmod(s, 60)
     h, m = divmod(m, 60)
@@ -843,7 +955,6 @@ def format_ass_time(ms: int) -> str:
     return f"{h}:{m:02d}:{s:02d}.{cs:02d}"
 
 def format_txt_time(ms: int) -> str:
-    """Format milliseconds as simple time (HH:MM:SS)"""
     s, ms = divmod(ms, 1000)
     m, s = divmod(s, 60)
     h, m = divmod(m, 60)
